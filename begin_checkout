@@ -1,0 +1,33 @@
+dataLayer.push({ ecommerce: null }); // Clear the previous ecommerce object.
+dataLayer.push({
+  event: "begin_checkout", // name of the event. In this case, it always must be begin_checkout
+  ecommerce: {
+    items: [ // an array with a product
+    {
+      item_id: "SKU_12345", // insert an actual product ID - One of item_id or item_name is required.
+      item_name: "3.9GHz 6-Core 5600G AMD Ryzen", // insert an actual product name - One of item_id or item_name is required.
+      item_brand: "Intel", // optional - insert an actual product brand
+      item_category: "Dedicated", // optional - insert an actual product category - The category of the item. If used as part of a category hierarchy or taxonomy then this will be the first category.
+      item_category2: "Instant Dedicated Servers", // optional - insert an actual additional product category
+      item_category3: "cat3", // optional - if it is possible to drill down the categories
+      item_category4: "cat4", // optional - if it is possible to drill down the categories
+      item_category5: "cat5", // optional - if it is possible to drill down the categories
+      item_variant: "variant", // optional insert an actual product variant
+      price: 9.99, // optional - insert an actual product price. Number or a string. Don't include currency code
+      quantity: 1 // optional - insert an actual product quantity
+    },{
+      item_id: "SKU_12345",
+      item_name: "3.9GHz 6-Core 5600G AMD Ryzen",
+      item_brand: "Intel",
+      item_category: "Dedicated",
+      item_category2: "Instant Dedicated Servers",
+      item_category3: "cat3",
+      item_category4: "cat4",
+      item_category5: "cat5",
+      item_variant: "variant",
+      price: 9.99,
+      quantity: 1
+    }
+    ]
+  }
+});
