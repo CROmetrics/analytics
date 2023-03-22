@@ -2,6 +2,8 @@ dataLayer.push({ ecommerce: null }); // Clear the previous ecommerce object.
 dataLayer.push({
   event: "view_item", // name of the event. In this case, it always must be view_item
   ecommerce: {
+    currency: "USD",
+    value: 7.77 //
     items: [ // an array with a product
     {
       item_id: "SKU_12345", // insert an actual product ID - One of item_id or item_name is required.
