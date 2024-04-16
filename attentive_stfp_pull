@@ -1,0 +1,200 @@
+from google.cloud import bigquery
+from google.cloud.exceptions import NotFound
+import paramiko
+import datetime
+import csv
+from io import StringIO
+from collections import defaultdict
+import time
+import re
+import hashlib
+import base64
+
+# Get the previous date for the file path
+def get_yesterday_date():
+    return (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y%m%d')
+
+# SFTP setup
+host = "sftp.client.attentivemobile.com"
+port = 22
+username = "signals"
+password = "rS22NMoalb4UshXcM9zS"
+
+# SFTP file path
+file_date = get_yesterday_date()
+file_name = f"downloads/signals_attentive_email_SMS_{file_date}.csv"
+
+# BigQuery setup
+client = bigquery.Client()
+dataset_id = 'signals'
+event_table_id = 'attentive-import'
+client_table_id = 'client-list'
+
+# Define the BigQuery dataset and table
+dataset_ref = client.dataset(dataset_id)
+event_table_ref = dataset_ref.table(event_table_id)
+client_table_ref = dataset_ref.table(client_table_id)
+
+def hash_email(email):
+    # Remove whitespace
+    email_no_spaces = re.sub(r'\s+', '', email)
+    
+    # Convert to lowercase
+    email_lower = email_no_spaces.lower()
+    
+    # Compute MD5 hash
+    md5_hash = hashlib.md5(email_lower.encode()).hexdigest()
+    
+    return md5_hash
+
+def fetch_csv_from_sftp():
+    transport = paramiko.Transport((host, port))
+    transport.connect(username=username, password=password)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+
+    data_list = []
+    try:
+        with sftp.open(file_name, "r") as file_handle:
+            file_content = file_handle.read()
+
+        csv_file = StringIO(file_content.decode('utf-8'))
+        csv_reader = csv.DictReader(csv_file)
+        data_list = list(csv_reader)
+
+    finally:
+        sftp.close()
+        transport.close()
+
+    return data_list
+
+def process_data(data):
+    grouped_data = defaultdict(lambda: {
+        "Date": None,
+        "Date_Email_Sent": None,
+        "Campaign": None,
+        "Child_Campaign": None,
+        "Campaign_ID": None,
+        "Subject_Line": None,
+        "From_Name": "(not set)",
+        "List_Name": "(not set)",
+        "Sent": set(),
+        "Bounces_Total": set(),
+        "Bounces_Hard": set(),
+        "Bounces_Soft": set(),
+        "Delivered": set(),
+        "Opens": set(),
+        "Clicks": set(),
+        "Unsubscribes": set(),
+        "Complaints": None,
+        "Creative_URL": "(not set)",
+        "Message_ID": None,
+    })
+
+    client_list = []
+
+    for row in data:
+        campaign_id = row['message_id']
+        entry = grouped_data[campaign_id]
+
+        entry["Date"] = row["timestamp"].split('T')[0]
+        entry["Date_Email_Sent"] = row["timestamp"].split('T')[0]
+        entry["Campaign"] = row["message_type"]
+        entry["Child_Campaign"] = row["message_name"]
+        entry["Campaign_ID"] = campaign_id
+        entry["Message_ID"] = row["message_id"]
+        entry["Subject_Line"] = row["message_name"]
+
+        if row['type'] in ['EMAIL_PROCESSED', 'MESSAGE_RECEIPT']:
+            entry["Sent"].add(row['email'])
+        if row['type'] in ['EMAIL_SOFT_BOUNCE', 'EMAIL_HARD_BOUNCE']:
+            entry["Bounces_Total"].add(row['email'])
+        if row['type'] in ['EMAIL_HARD_BOUNCE']:
+            entry["Bounces_Hard"].add(row['email'])
+        if row['type'] in ['EMAIL_SOFT_BOUNCE']:
+            entry["Bounces_Soft"].add(row['email'])
+        if row['type'] in ['EMAIL_DELIVERED', 'MESSAGE_RECEIPT']:
+            entry["Delivered"].add(row['email'])
+        if row['type'] in ['EMAIL_MESSAGE_OPENED', 'MESSAGE_RECEIPT']:
+            entry["Opens"].add(row['email'])
+        if row['type'] in ['MESSAGE_LINK_CLICK']:
+            entry["Clicks"].add(row['email'])
+        if row['type'] in ['SUBSCRIPTION_SUPPRESSED']:
+            entry["Unsubscribes"].add(row['email'])
+
+        email = hash_email(row['email'])
+        client_list.append({
+            "Message_ID": row["message_id"],
+            "User_ID": email,
+        })
+
+    # Convert sets to counts
+    for key in grouped_data:
+        grouped_data[key]['Sent'] = len(grouped_data[key]['Sent'])
+        grouped_data[key]['Bounces_Total'] = len(grouped_data[key]['Bounces_Total'])
+        grouped_data[key]['Bounces_Hard'] = len(grouped_data[key]['Bounces_Hard'])
+        grouped_data[key]['Bounces_Soft'] = len(grouped_data[key]['Bounces_Soft'])
+        grouped_data[key]['Delivered'] = len(grouped_data[key]['Delivered'])
+        grouped_data[key]['Opens'] = len(grouped_data[key]['Opens'])
+        grouped_data[key]['Clicks'] = len(grouped_data[key]['Clicks'])
+        grouped_data[key]['Unsubscribes'] = len(grouped_data[key]['Unsubscribes'])
+
+    return {"event_data": list(grouped_data.values()), "client_data": client_list}
+
+def ensure_tables_exist():
+    # Create the events table if it does not exist
+    try:
+        client.get_table(event_table_ref)
+    except NotFound:
+        schema = [
+            bigquery.SchemaField("Date", "DATE"),
+            bigquery.SchemaField("Date_Email_Sent", "DATE"),
+            bigquery.SchemaField("Campaign", "STRING"),
+            bigquery.SchemaField("Campaign_ID", "STRING"),
+            bigquery.SchemaField("Sent", "INTEGER"),
+            bigquery.SchemaField("Bounces_Total", "INTEGER"),
+            bigquery.SchemaField("Bounces_Hard", "INTEGER"),
+            bigquery.SchemaField("Bounces_Soft", "INTEGER"),
+            bigquery.SchemaField("Delivered", "INTEGER"),
+            bigquery.SchemaField("Opens", "INTEGER"),
+            bigquery.SchemaField("Clicks", "INTEGER"),
+            bigquery.SchemaField("Unsubscribes", "INTEGER"),
+            bigquery.SchemaField("Complaints", "INTEGER"),
+            bigquery.SchemaField("Creative_URL", "STRING"),
+            bigquery.SchemaField("Child_Campaign", "STRING"),
+            bigquery.SchemaField("List_Name", "STRING"),
+            bigquery.SchemaField("From_Name", "STRING"),
+            bigquery.SchemaField("Subject_Line", "STRING"),
+            bigquery.SchemaField("Message_ID", "STRING"),
+        ]
+        table = bigquery.Table(event_table_ref, schema=schema)
+        table = client.create_table(table)
+        time.sleep(30)
+
+    # Create the client table if it does not exist
+    try:
+        client.get_table(client_table_ref)
+    except NotFound:
+        schema = [
+            bigquery.SchemaField("Message_ID", "STRING"),
+            bigquery.SchemaField("User_ID", "STRING"),
+        ]
+        table = bigquery.Table(client_table_ref, schema=schema)
+        table = client.create_table(table)
+        time.sleep(30)
+
+def insert_into_bigquery(data):
+    ensure_tables_exist()
+    errors = client.insert_rows_json(event_table_ref, data['event_data'])
+    errors.extend(client.insert_rows_json(client_table_ref, data['client_data']))
+    return "New rows have been added." if not errors else str(errors)
+
+def sync(event, context):
+    try:
+        message = base64.b64decode(event['data']).decode('utf-8')  # Decode your message
+        file_data = fetch_csv_from_sftp()
+        processed_data = process_data(file_data)
+        result = insert_into_bigquery(processed_data)
+        print(f"Processed data successfully: {result}")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise e
