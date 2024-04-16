@@ -27,7 +27,7 @@ file_name = f"downloads/signals_attentive_email_SMS_{file_date}.csv"
 # BigQuery setup
 client = bigquery.Client()
 dataset_id = 'signals'
-event_table_id = 'attentive-import'
+event_table_id = 'email_export'
 client_table_id = 'client-list'
 
 # Define the BigQuery dataset and table
@@ -71,6 +71,7 @@ def process_data(data):
     grouped_data = defaultdict(lambda: {
         "Date": None,
         "Date_Email_Sent": None,
+        "Lifecycle_Channel": None,
         "Campaign": None,
         "Child_Campaign": None,
         "Campaign_ID": None,
@@ -97,12 +98,13 @@ def process_data(data):
         entry = grouped_data[campaign_id]
 
         entry["Date"] = row["timestamp"].split('T')[0]
-        entry["Date_Email_Sent"] = row["timestamp"].split('T')[0]
+        entry["Date_Email_Sent"] = row["message_start"].split(' ')[0] or row["timestamp"].split('T')[0]
+        entry["Lifecycle_Channel"] = 'SMS' if row["subscription_channel"] == 'TEXT' else 'Email'
         entry["Campaign"] = row["message_type"]
-        entry["Child_Campaign"] = row["message_name"]
+        entry["Child_Campaign"] = row["message_name"] or row["message_text"]
         entry["Campaign_ID"] = campaign_id
         entry["Message_ID"] = row["message_id"]
-        entry["Subject_Line"] = row["message_name"]
+        entry["Subject_Line"] = row["message_text"] or row["message_name"]
 
         if row['type'] in ['EMAIL_PROCESSED', 'MESSAGE_RECEIPT']:
             entry["Sent"].add(row['email'])
@@ -148,6 +150,7 @@ def ensure_tables_exist():
         schema = [
             bigquery.SchemaField("Date", "DATE"),
             bigquery.SchemaField("Date_Email_Sent", "DATE"),
+            bigquery.SchemaField("Lifecycle_Channel", "STRING"),
             bigquery.SchemaField("Campaign", "STRING"),
             bigquery.SchemaField("Campaign_ID", "STRING"),
             bigquery.SchemaField("Sent", "INTEGER"),
