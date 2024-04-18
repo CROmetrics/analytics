@@ -9,10 +9,11 @@ import time
 import re
 import hashlib
 import base64
+import json
 
-# Get the previous date for the file path
-def get_yesterday_date():
-    return (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y%m%d')
+"""
+SFTP and BigQuery variables are defined at the top of the script for easy configuration.
+"""
 
 # SFTP setup
 host = "sftp.client.attentivemobile.com"
@@ -20,21 +21,37 @@ port = 22
 username = "signals"
 password = "rS22NMoalb4UshXcM9zS"
 
-# SFTP file path
-file_date = get_yesterday_date()
-file_name = f"downloads/signals_attentive_email_SMS_{file_date}.csv"
-
 # BigQuery setup
 client = bigquery.Client()
 dataset_id = 'signals'
-event_table_id = 'email_export'
-client_table_id = 'client-list'
+table_ids = {
+    'event': 'attentive-import',
+    'client': 'client-list',
+    'staging_event': 'attentive-import-staging',
+    'staging_client': 'client-list-staging'
+}
 
-# Define the BigQuery dataset and table
+# Define the BigQuery dataset and table references
 dataset_ref = client.dataset(dataset_id)
-event_table_ref = dataset_ref.table(event_table_id)
-client_table_ref = dataset_ref.table(client_table_id)
+table_refs = {key: dataset_ref.table(value) for key, value in table_ids.items()}
 
+"""
+HELPER FUNCTIONS. These functions are used to perform various tasks such as date range computation and hashing.
+"""
+
+# Get the previous date for the file path
+def get_yesterday_date():
+    return (datetime.datetime.now() - datetime.timedelta(days=1)).strftime('%Y%m%d')
+
+# Get the date range for file processing. The date range will start at either two days before yesterday, or two days before the max date in bigquery. Whichever is earlier.
+def get_date_range():
+    """Compute the date range for file processing."""
+    max_date = get_max_date_from_bigquery()
+    yesterday = datetime.date.today() - datetime.timedelta(days=1)
+    start_date = max_date - datetime.timedelta(days=2) if max_date and max_date > yesterday - datetime.timedelta(days=2) else yesterday - datetime.timedelta(days=2)
+    return start_date, yesterday
+
+# Hash the email address using MD5
 def hash_email(email):
     # Remove whitespace
     email_no_spaces = re.sub(r'\s+', '', email)
@@ -47,7 +64,69 @@ def hash_email(email):
     
     return md5_hash
 
-def fetch_csv_from_sftp():
+"""
+MAIN FUNCTIONS. Here is a breakdown of how the sync function works:
+1. Ensure all necessary BigQuery tables exist. If not, create them.
+2. Fetch the date range for which data needs to be processed.
+3. Generate the filenames for each day in the date range.
+4. Fetch and process data for each file.
+5. Load processed data into the staging table and execute the merge operation.
+"""
+
+# Get the maximum date from the event table in BigQuery
+def get_max_date_from_bigquery():
+    query = f"SELECT MAX(Date) AS max_date FROM `{table_refs['event']}`"
+    result = client.query(query).result()
+    return next(iter(result), {}).get('max_date')
+
+# Define schema based on table key
+def define_schema(table_key):
+    """Define schema based on table key."""
+    if 'event' in table_key:
+        return [
+            bigquery.SchemaField("Date", "DATE"),
+            bigquery.SchemaField("Date_Email_Sent", "DATE"),
+            bigquery.SchemaField("Lifecycle_Channel", "STRING"),
+            bigquery.SchemaField("Campaign", "STRING"),
+            bigquery.SchemaField("Campaign_ID", "STRING"),
+            bigquery.SchemaField("Sent", "INTEGER"),
+            bigquery.SchemaField("Bounces_Total", "INTEGER"),
+            bigquery.SchemaField("Bounces_Hard", "INTEGER"),
+            bigquery.SchemaField("Bounces_Soft", "INTEGER"),
+            bigquery.SchemaField("Delivered", "INTEGER"),
+            bigquery.SchemaField("Opens", "INTEGER"),
+            bigquery.SchemaField("Clicks", "INTEGER"),
+            bigquery.SchemaField("Unsubscribes", "INTEGER"),
+            bigquery.SchemaField("Complaints", "INTEGER"),
+            bigquery.SchemaField("Creative_URL", "STRING"),
+            bigquery.SchemaField("Child_Campaign", "STRING"),
+            bigquery.SchemaField("List_Name", "STRING"),
+            bigquery.SchemaField("From_Name", "STRING"),
+            bigquery.SchemaField("Subject_Line", "STRING"),
+            bigquery.SchemaField("Message_ID", "STRING"),
+        ]
+    elif 'client' in table_key:
+        return [
+            bigquery.SchemaField("Message_ID", "STRING"),
+            bigquery.SchemaField("User_ID", "STRING"),
+        ]
+    return []
+
+# Ensure all necessary BigQuery tables exist
+def ensure_tables_exist():
+    """Ensure all necessary BigQuery tables exist, create if not."""
+    for key, table_ref in table_refs.items():
+        try:
+            client.get_table(table_ref)
+        except NotFound:
+            # Schema should be defined outside and passed as a parameter
+            schema = define_schema(key)
+            table = bigquery.Table(table_ref, schema=schema)
+            client.create_table(table)
+            print(f"Table created: {table_ref}")
+
+# Fetch CSV file from SFTP server
+def fetch_csv_from_sftp(file_name):
     transport = paramiko.Transport((host, port))
     transport.connect(username=username, password=password)
     sftp = paramiko.SFTPClient.from_transport(transport)
@@ -67,6 +146,8 @@ def fetch_csv_from_sftp():
 
     return data_list
 
+# Process the data and return a dictionary with event and client data
+# We use the Python set data structure to store unique email addresses for each event type. This allows us to easily count the number of unique emails for each event type.
 def process_data(data):
     grouped_data = defaultdict(lambda: {
         "Date": None,
@@ -142,62 +223,90 @@ def process_data(data):
 
     return {"event_data": list(grouped_data.values()), "client_data": client_list}
 
-def ensure_tables_exist():
-    # Create the events table if it does not exist
-    try:
-        client.get_table(event_table_ref)
-    except NotFound:
-        schema = [
-            bigquery.SchemaField("Date", "DATE"),
-            bigquery.SchemaField("Date_Email_Sent", "DATE"),
-            bigquery.SchemaField("Lifecycle_Channel", "STRING"),
-            bigquery.SchemaField("Campaign", "STRING"),
-            bigquery.SchemaField("Campaign_ID", "STRING"),
-            bigquery.SchemaField("Sent", "INTEGER"),
-            bigquery.SchemaField("Bounces_Total", "INTEGER"),
-            bigquery.SchemaField("Bounces_Hard", "INTEGER"),
-            bigquery.SchemaField("Bounces_Soft", "INTEGER"),
-            bigquery.SchemaField("Delivered", "INTEGER"),
-            bigquery.SchemaField("Opens", "INTEGER"),
-            bigquery.SchemaField("Clicks", "INTEGER"),
-            bigquery.SchemaField("Unsubscribes", "INTEGER"),
-            bigquery.SchemaField("Complaints", "INTEGER"),
-            bigquery.SchemaField("Creative_URL", "STRING"),
-            bigquery.SchemaField("Child_Campaign", "STRING"),
-            bigquery.SchemaField("List_Name", "STRING"),
-            bigquery.SchemaField("From_Name", "STRING"),
-            bigquery.SchemaField("Subject_Line", "STRING"),
-            bigquery.SchemaField("Message_ID", "STRING"),
-        ]
-        table = bigquery.Table(event_table_ref, schema=schema)
-        table = client.create_table(table)
-        time.sleep(30)
+# Merge the event data into the BigQuery table
+def merge_event_data():
+    merge_sql = f"""
+    MERGE `{table_refs['event']}` T
+    USING `{table_refs['staging_event']}` S
+    ON T.Date = S.Date AND T.Message_ID = S.Message_ID
+    WHEN MATCHED THEN
+      UPDATE SET T.Date_Email_Sent = S.Date_Email_Sent, T.Lifecycle_Channel = S.Lifecycle_Channel, T.Campaign = S.Campaign, T.Campaign_ID = S.Campaign_ID, T.Sent = S.Sent, T.Bounces_Total = S.Bounces_Total, T.Bounces_Hard = S.Bounces_Hard, T.Bounces_Soft = S.Bounces_Soft, T.Delivered = S.Delivered, T.Opens = S.Opens, T.Clicks = S.Clicks, T.Unsubscribes = S.Unsubscribes, T.Complaints = S.Complaints, T.Creative_URL = S.Creative_URL, T.Child_Campaign = S.Child_Campaign, T.List_Name = S.List_Name, T.From_Name = S.From_Name, T.Subject_Line = S.Subject_Line
+    WHEN NOT MATCHED THEN
+      INSERT (Date, Date_Email_Sent, Lifecycle_Channel, Campaign, Campaign_ID, Sent, Bounces_Total, Bounces_Hard, Bounces_Soft, Delivered, Opens, Clicks, Unsubscribes, Complaints, Creative_URL, Child_Campaign, List_Name, From_Name, Subject_Line, Message_ID) VALUES (S.Date, S.Date_Email_Sent, S.Lifecycle_Channel, S.Campaign, S.Campaign_ID, S.Sent, S.Bounces_Total, S.Bounces_Hard, S.Bounces_Soft, S.Delivered, S.Opens, S.Clicks, S.Unsubscribes, S.Complaints, S.Creative_URL, S.Child_Campaign, S.List_Name, S.From_Name, S.Subject_Line, S.Message_ID)
+    """
+    client.query(merge_sql).result()
+    print("Data merged successfully.")
 
-    # Create the client table if it does not exist
-    try:
-        client.get_table(client_table_ref)
-    except NotFound:
-        schema = [
-            bigquery.SchemaField("Message_ID", "STRING"),
-            bigquery.SchemaField("User_ID", "STRING"),
-        ]
-        table = bigquery.Table(client_table_ref, schema=schema)
-        table = client.create_table(table)
-        time.sleep(30)
+# Merge the client data into the BigQuery table
+def merge_client_data():
+    merge_sql = f"""
+    MERGE `{table_refs['client']}` T
+    USING `{table_refs['staging_client']}` S
+    ON T.Message_ID = S.Message_ID AND T.User_ID = S.User_ID
+    WHEN NOT MATCHED THEN
+      INSERT (Message_ID, User_ID) VALUES (S.Message_ID, S.User_ID)
+    """
+    client.query(merge_sql).result()
+    print("Data merged successfully.")
 
-def insert_into_bigquery(data):
-    ensure_tables_exist()
-    errors = client.insert_rows_json(event_table_ref, data['event_data'])
-    errors.extend(client.insert_rows_json(client_table_ref, data['client_data']))
-    return "New rows have been added." if not errors else str(errors)
+# Clear the staging table
+def clear_staging_table():
+    clear_sql = f"DELETE FROM `{table_refs['staging_event']}` WHERE TRUE"
+    client.query(clear_sql).result()
+    clear_sql = f"DELETE FROM `{table_refs['staging_client']}` WHERE TRUE"
+    client.query(clear_sql).result()
+    print("Staging table cleared.")
 
+# Load data into the staging table and perform the merge operation
+def load_data_to_staging(data):
+    clear_staging_table()
+
+    # Helper function to batch data uploads. BigQuery can only upload 50000 rows at a time.
+    def batch_load_data(table_ref, data, batch_size=50000):
+        total_rows = len(data)
+        for start_index in range(0, total_rows, batch_size):
+            end_index = start_index + batch_size
+            batch = data[start_index:end_index]
+            errors = client.insert_rows_json(table_ref, batch)
+            if errors:
+                print(f"Encountered errors while loading data to staging: {errors}")
+            else:
+                print(f"Loaded rows {start_index} to {end_index} to staging table.")
+
+    batch_load_data(table_refs['staging_event'], data['event_data'])
+    merge_event_data()
+
+    batch_load_data(table_refs['staging_client'], data['client_data'])
+    merge_client_data()
+
+# Main function to synchronize data from SFTP to BigQuery
 def sync(event, context):
     try:
-        message = base64.b64decode(event['data']).decode('utf-8')  # Decode your message
-        file_data = fetch_csv_from_sftp()
-        processed_data = process_data(file_data)
-        result = insert_into_bigquery(processed_data)
-        print(f"Processed data successfully: {result}")
+        message = base64.b64decode(event['data']).decode('utf-8') if event and 'data' in event else 'default'
+
+        ensure_tables_exist()
+
+        start_date, end_date = get_date_range()
+        date_range = [start_date + datetime.timedelta(days=x) for x in range((end_date - start_date).days + 1)]
+        file_names = [f"downloads/signals_attentive_email_SMS_{date.strftime('%Y%m%d')}.csv" for date in date_range]
+
+        full_event_data = []
+        full_client_data = []
+
+        print(f"Processing data for files: {file_names}")
+
+        for file_name in file_names:
+            file_data = fetch_csv_from_sftp(file_name)
+            processed_data = process_data(file_data)
+            full_event_data.extend(processed_data['event_data'])
+            full_client_data.extend(processed_data['client_data'])
+
+        print(f"Processed data for {len(file_names)} files.")
+
+        load_data_to_staging({'event_data': full_event_data, 'client_data': full_client_data})
+
+        print("Processed data successfully and merged into BigQuery.")
+        
     except Exception as e:
         print(f"Error: {str(e)}")
         raise e
